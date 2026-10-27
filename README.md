@@ -29,13 +29,34 @@ fine-tuning, no Ollama template hacking.
 2. **Rewrites history into plain turns.** `assistant.tool_calls` become the JSON text the model
    is supposed to emit, and `role: "tool"` results become `user` turns labeled
    `TOOL RESULT (name=...)`. The upstream model never sees roles it cannot follow.
-3. **Promotes JSON back into `tool_calls`.** Replies are scanned for balanced JSON objects
-   (string-aware brace matching) and any object whose `name` matches a registered tool is
-   lifted into a proper `tool_calls` entry — in both buffered and streaming responses.
+3. **Promotes text back into `tool_calls`.** Replies are scanned for every common markup
+   dialect (see below) plus bare/fenced JSON, and any call whose `name` matches a registered
+   tool is lifted into a proper `tool_calls` entry — in both buffered and streaming responses.
    Unknown names are ignored, so ordinary JSON in prose is left alone.
+4. **Repairs the call shape.** A `readFile` is snapped to the registered `read_file` (only on a
+   unique separator/case-insensitive match — never to a *different* tool), and each argument is
+   coerced against the tool's JSON Schema: `"30"` → `30`, `"false"` → `false`,
+   `"[-l, -a]"` → `["-l","-a"]`, `42` → `"42"` for a string field. Shapes are fixed; values are
+   never invented.
 
 Because it strips `tools` / `tool_choice` / `parallel_tool_calls` before forwarding, the
 upstream model never has to understand OpenAI's tool schema at all.
+
+### Formats understood
+
+| dialect | example |
+| ------- | ------- |
+| bare / fenced JSON | `{"name": "read_file", "arguments": {"path": "a.js"}}` |
+| Qwen `<tool_call>` | `<tool_call>{"name": ...}</tool_call>` |
+| Qwen 3 XML | `<function=read_file><parameter=path>a.js</parameter></function>` |
+| Anthropic-style | `<invoke name="read_file"><parameter name="path">a.js</parameter></invoke>` |
+| Mistral | `[TOOL_CALLS] [{"name": ...}]` |
+| Llama 3 | `<\|python_tag\|>{"name": ...}` |
+| OpenAI nested | `{"type":"function","function":{"name":...,"arguments":"{...}"}}` |
+
+Brace/bracket matching is string-aware, so `{"path": "a{b}.js"}` survives intact. Each dialect
+is consumed and blanked before the next pass runs, so a call is never promoted twice.
+
 
 ## Quick start
 
@@ -98,19 +119,23 @@ directory, `BENCH_ROOT` (default: the current working directory). Adjust the pro
 
 ### Sample bench output
 
+Measured through the proxy with `qwen2.5-coder:7b` on an M-series Mac, 3 runs per case:
+
 ```
 case         ok/n   badArgs  leak  avgMs
-list-dir     3/3    0        0     1840
-read-file    3/3    0        0     2105
-search       3/3    0        0     1977
-run-cmd      3/3    0        0     2560
-no-tool      2/2    0        0     1602
+list-dir     3/3    0        0     1601
+read-file    2/3    0        0     2815
+search       3/3    0        0     1120
+run-cmd      3/3    0        0     1238
+no-tool      2/2    0        0     1209
 
-TOTAL 14/14 = 100%
+TOTAL 13/14 = 93%
 ```
 
-`leak` counts replies where a tool-call-shaped JSON stayed visible in `content` instead of
-becoming a `tool_call` — the exact failure mode this proxy exists to remove.
+The one miss was the model answering `read-file` straight from memory instead of calling the
+tool — not a parsing failure. `leak` counts replies where a tool-call-shaped JSON stayed
+visible in `content` instead of becoming a `tool_call`: the exact failure mode this proxy
+exists to remove, and it stayed at zero.
 
 ## Limitations
 
@@ -118,8 +143,14 @@ becoming a `tool_call` — the exact failure mode this proxy exists to remove.
   discouraged for small models.
 - Streaming responses are fully buffered until the proxy can tell prose from a tool call, so
   first-token latency for tool calls equals full-generation latency. Plain prose streams live.
+  A reply that opens with real prose (`Sure! <tool_call>…`) is streamed as text as soon as the
+  prefix can no longer be a tool call, so its trailing call is not recovered — the buffered
+  (non-streaming) path has no such limitation.
+- Argument repair fixes *shape*, not intent: an integer field that gets `"three"` stays as
+  sent, and required arguments are not filled in.
 - Tool schemas are flattened to `name(arg: type)` text, so nested object schemas lose detail
-  beyond the top level.
+  beyond the top level. (The flat view is only for the prompt; the full schema is still used
+  for argument repair.)
 - `/v1/completions`, embeddings, and image inputs are not handled.
 
 ## License
