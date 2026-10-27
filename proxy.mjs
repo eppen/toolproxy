@@ -319,6 +319,140 @@ function couldBeToolStart(text) {
   return false;
 }
 
+// ---------------------------------------------------------------- stream splitter
+
+// Prose is held back until a newline arrives (so a "先说话后调工具" reply cannot
+// slip through) or until it grows past this many chars (so long single-line
+// answers still stream). PROSE_KEEP_TAIL keeps a small tail so a marker split
+// across two deltas is still recognised.
+const PROSE_HOLD_MAX = 200;
+const PROSE_KEEP_TAIL = 12;
+
+/**
+ * How much of a *possible* tool-call buffer can be handed back as prose right
+ * now? Returns 0 while it could still be a call (we must keep waiting).
+ */
+function releaseAsProse(text, toolNames, toolSchemas) {
+  const head = String(text || '').trimStart();
+  const lead = text.length - head.length;
+
+  // bare JSON value / array of objects
+  if (head[0] === '{' || (head[0] === '[' && /^\[\s*\{/.test(head))) {
+    const end = matchPair(text, lead);
+    if (end === -1) return 0;                       // still open: could become a call
+    const closed = text.slice(0, end + 1);
+    if (toolNames && toolNames.size > 0 && extractToolCalls(closed, toolNames, toolSchemas).length > 0) return 0;
+    return end + 1;                                 // complete, and not a call: plain JSON
+  }
+
+  // fenced block: release once the closing fence arrives and holds no call
+  if (head.startsWith('```')) {
+    const open = lead + 3;
+    const close = text.indexOf('```', open);
+    if (close === -1) return 0;
+    const end = close + 3;
+    if (toolNames && toolNames.size > 0 && extractToolCalls(text.slice(0, end), toolNames, toolSchemas).length > 0) return 0;
+    return end;
+  }
+
+  return 0; // markup markers: wait for the end of the stream
+}
+
+/** Index of the first tool-call-looking construct in `text`, or -1. */
+function firstCandidateIndex(text) {
+  let at = -1;
+  for (const needle of ['{', '```', '<tool_call', '<function=', '<invoke', MISTRAL_MARKER, PYTHON_TAG]) {
+    const i = text.indexOf(needle);
+    if (i !== -1 && (at === -1 || i < at)) at = i;
+  }
+  return at;
+}
+
+/** Text that precedes the first tool-call-looking construct, for flushing as prose. */
+function preludeOf(text) {
+  const at = firstCandidateIndex(text);
+  return at > 0 ? text.slice(0, at) : '';
+}
+
+/**
+ * Turns a delta stream into { text } pushes plus one final { text, calls }.
+ * Unlike a first-token decision, prose is only flushed on a newline / size
+ * threshold, and a JSON value that turns out not to be a tool call is released
+ * back into the text stream instead of stalling until the end.
+ */
+function createStreamSplitter({ toolNames = new Set(), toolSchemas = null, maxHold = PROSE_HOLD_MAX, keepTail = PROSE_KEEP_TAIL } = {}) {
+  let buffer = '';
+  let holding = false; // buffer currently looks like (or may become) a tool call
+
+  function drain(final, out) {
+    while (buffer.length > 0) {
+      if (holding) {
+        if (final) break;                            // caller extracts from the buffer
+        const rel = releaseAsProse(buffer, toolNames, toolSchemas);
+        if (rel === 0) break;
+        out.text += buffer.slice(0, rel);
+        buffer = buffer.slice(rel);
+        holding = false;
+        continue;
+      }
+
+      const head = buffer.trimStart();
+      if (!head) {
+        if (final) { out.text += buffer; buffer = ''; }
+        break;
+      }
+      if (couldBeToolStart(buffer)) { holding = true; continue; }
+
+      let cut = -1;
+      const nl = buffer.indexOf('\n');          // first newline
+      if (nl !== -1) cut = nl + 1;
+      const cand = firstCandidateIndex(buffer); // never flush a marker as prose
+      if (cand > 0 && (cut === -1 || cand < cut)) cut = cand;
+      if (cut === -1 && buffer.length >= maxHold) {
+        cut = cand > 0 ? cand : buffer.length - keepTail;
+      }
+
+      if (cut > 0) {
+        out.text += buffer.slice(0, cut);
+        buffer = buffer.slice(cut);
+        continue;
+      }
+      if (final) { out.text += buffer; buffer = ''; }
+      break;
+    }
+  }
+
+  return {
+    push(piece) {
+      const out = { text: '' };
+      if (piece) buffer += piece;
+      drain(false, out);
+      return out;
+    },
+    /** Flush the remainder; if it holds tool calls they come back as `calls`. */
+    end() {
+      const out = { text: '', calls: [] };
+      // Scan the whole remainder: a call can still be there even when the buffer
+      // head is prose (e.g. "Sure! {…}" with no newline in it).
+      if (buffer && toolNames && toolNames.size > 0) out.calls = extractToolCalls(buffer, toolNames, toolSchemas);
+      if (out.calls.length > 0) {
+        out.text += preludeOf(buffer);
+        buffer = '';
+        holding = false;
+        out.done = true;
+        return out;
+      }
+      drain(true, out);
+      if (buffer) { out.text += buffer; buffer = ''; } // leftover candidate: it was just text
+      holding = false;
+      out.done = true;
+      return out;
+    },
+    get mode() { return holding ? 'maybe-tool' : 'text'; },
+    get pending() { return buffer; },
+  };
+}
+
 /**
  * Pull tool calls out of a plain-text reply.
  * Handles bare/fenced JSON, `<tool_call>` wrappers, Qwen 3 `<function=...>`
@@ -552,9 +686,8 @@ async function handleChat(req, res, raw) {
 
   send({ role: 'assistant', content: '' });
 
-  let buffer = '';
-  let mode = 'undecided'; // undecided | text | maybe-tool
   let emitted = 0;
+  const splitter = createStreamSplitter({ toolNames, toolSchemas });
 
   const reader = up.body.getReader();
   const decoder = new TextDecoder();
@@ -571,17 +704,13 @@ async function handleChat(req, res, raw) {
     const piece = delta.content;
     if (!piece) return;
 
-    if (mode === 'text') { send({ content: piece }); emitted += piece.length; return; }
-
-    buffer += piece;
-    // Still deciding: keep buffering while the head could still become a tool
-    // call in any supported format, otherwise stream it out as prose.
-    if (couldBeToolStart(buffer)) { mode = 'maybe-tool'; return; }
-
-    mode = 'text';
-    send({ content: buffer });
-    emitted += buffer.length;
-    buffer = '';
+    // Prose goes out as soon as it is unambiguous; a candidate tool call is held
+    // until it completes (or proves to be plain JSON).
+    const step = splitter.push(piece);
+    if (step.text) {
+      send({ content: step.text });
+      emitted += step.text.length;
+    }
   };
 
   try {
@@ -598,10 +727,12 @@ async function handleChat(req, res, raw) {
     }
     if (pending) consumeLine(pending);
 
-    let calls = [];
-    if (mode === 'maybe-tool' && toolNames.size > 0) {
-      calls = extractToolCalls(buffer, toolNames, toolSchemas);
+    const tail = splitter.end();
+    if (tail.text) {
+      send({ content: tail.text });
+      emitted += tail.text.length;
     }
+    const calls = tail.calls || [];
 
     if (calls.length > 0) {
       const toolCalls = calls.map((c, idx) => ({
@@ -614,7 +745,6 @@ async function handleChat(req, res, raw) {
       send({}, 'tool_calls');
       log(`POST ${modelName} stream=1 tools=${toolNames.size} calls=${calls.length} ${Date.now() - t0}ms`);
     } else {
-      if (buffer) { send({ content: buffer }); emitted += buffer.length; }
       send({}, 'stop');
       log(`POST ${modelName} stream=1 tools=${toolNames.size} calls=0 chars=${emitted} ${Date.now() - t0}ms`);
     }
@@ -683,5 +813,5 @@ if (process.env.PROXY_NO_LISTEN !== '1') {
 
 export {
   renderToolProtocol, extractToolCalls, convertMessages, normalizeCall, matchBrace,
-  coerceValue, resolveToolName, couldBeToolStart,
+  coerceValue, resolveToolName, couldBeToolStart, createStreamSplitter,
 };

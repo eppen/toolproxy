@@ -90,8 +90,8 @@ for (const c of CASES) {
     }
     lat.push(Date.now() - t0);
     const calls = res.toolCalls;
-    // leak = a tool-call-looking JSON left in the visible content
-    if (c.expect && calls.length === 0 && /^\s*(```)?(json)?\s*\{\s*"name"/.test(res.content)) leak++;
+    // leak = a tool-call-looking JSON left in the visible content (any line, not just the first)
+    if (c.expect && calls.length === 0 && /(^|\n)\s*(```(?:json)?)?\s*\{\s*"name"\s*:/.test(res.content)) leak++;
     if (c.expect === null) {
       if (calls.length === 0 && res.content.trim()) ok++;
       else console.log(`  ${c.id} run${r + 1} UNEXPECTED CALL ${calls.map((x) => x.name).join(',')}`);

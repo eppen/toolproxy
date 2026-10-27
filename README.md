@@ -141,11 +141,12 @@ exists to remove, and it stayed at zero.
 
 - One JSON object per reply is the documented protocol; multiple calls are supported but
   discouraged for small models.
-- Streaming responses are fully buffered until the proxy can tell prose from a tool call, so
-  first-token latency for tool calls equals full-generation latency. Plain prose streams live.
-  A reply that opens with real prose (`Sure! <tool_call>…`) is streamed as text as soon as the
-  prefix can no longer be a tool call, so its trailing call is not recovered — the buffered
-  (non-streaming) path has no such limitation.
+- Streaming keeps a tool-call *candidate* buffered until the value completes, so first-token
+  latency for a tool call equals full-generation latency. Prose is held only until its first
+  newline (or 200 chars), then streams live. A reply that opens with a greeting and *then* emits
+  a call (`好的，请稍等。\n{…}`) keeps the greeting as content and still yields real
+  `tool_calls`; a complete JSON value that is not a registered call is released back as text
+  instead of stalling to the end of the stream.
 - Argument repair fixes *shape*, not intent: an integer field that gets `"three"` stays as
   sent, and required arguments are not filled in.
 - Tool schemas are flattened to `name(arg: type)` text, so nested object schemas lose detail

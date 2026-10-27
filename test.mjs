@@ -1,6 +1,6 @@
 // Unit tests for the tool-call extraction layer. Run: node test.mjs
 process.env.PROXY_NO_LISTEN = '1';
-const { extractToolCalls, convertMessages, renderToolProtocol, couldBeToolStart } = await import('./proxy.mjs');
+const { extractToolCalls, convertMessages, renderToolProtocol, couldBeToolStart, createStreamSplitter } = await import('./proxy.mjs');
 
 const NAMES = new Set(['read_file', 'list_files', 'run_command']);
 let pass = 0, fail = 0;
@@ -167,6 +167,69 @@ check('<function= is a tool start', couldBeToolStart('<function=read_file>') ===
 check('[TOOL_CALLS] is a tool start', couldBeToolStart('[TOOL_CALLS] [') === true);
 check('<|python_tag|> is a tool start', couldBeToolStart('<|python_tag|>{') === true);
 check('partial marker keeps buffering', couldBeToolStart('<tool_c') === true);
+
+console.log('stream splitter');
+
+/** Feed `pieces` through a splitter; report what a client would have seen. */
+function feed(pieces, opts) {
+  const sp = createStreamSplitter({ toolNames: NAMES, toolSchemas: SCHEMAS, ...opts });
+  let text = '';
+  let flushedEarly = 0;
+  for (const p of pieces) {
+    const step = sp.push(p);
+    if (step.text) flushedEarly += step.text.length;
+    text += step.text;
+  }
+  const tail = sp.end();
+  text += tail.text;
+  return { text, calls: tail.calls, flushedEarly };
+}
+
+const sProse = '好的，请稍等。读取文件内容可能需要一些时间。\n';
+const sCall = '{"name": "read_file", "arguments": {"path": "a.js"}}';
+
+// the regression: greeting first, tool JSON after, streamed one char at a time
+let r = feed([...sProse + sCall]);
+check('prose-prefixed JSON becomes a tool call', r.calls.length === 1 && r.calls[0].name === 'read_file', r);
+check('...and the greeting is kept', r.text === sProse, r.text);
+check('...with no JSON left in the text', !r.text.includes('"name"'), r.text);
+
+r = feed([...`Sure! ${sCall}`]);
+check('one-line prose prefix + JSON still a call', r.calls.length === 1 && r.calls[0].name === 'read_file', r);
+
+r = feed(['好的。\n', '```json\n', sCall, '\n```']);
+check('prose prefix + fenced call', r.calls.length === 1 && r.calls[0].name === 'read_file', r);
+
+r = feed([sCall, '\n', '{"name":"list_files","arguments":{}}']);
+check('two calls after one end-of-stream pass', r.calls.length === 2, r);
+
+r = feed(['<tool_c', 'all>', sCall, '</tool_call>']);
+check('marker split across deltas', r.calls.length === 1 && r.calls[0].name === 'read_file', r);
+
+const prose = '这是纯文本回答。\n第二行也在这里。\n第三行收尾。';
+r = feed(prose.split(''));
+check('plain prose loses no characters', r.text === prose && r.calls.length === 0, r.text);
+check('plain prose starts streaming before the end', r.flushedEarly > 0, r.flushedEarly);
+
+const longLine = '甲'.repeat(300);
+r = feed(longLine.split(''));
+check('long single-line prose is released mid-stream', r.text === longLine && r.flushedEarly >= 150, { len: r.text.length, flushedEarly: r.flushedEarly });
+
+const notACall = '{"response": "ok", "files": ["a"]}';
+r = feed([...`总结如下：\n${notACall}`]);
+check('non-tool JSON is not swallowed', r.calls.length === 0 && r.text === `总结如下：\n${notACall}`, r.text);
+
+const codeBlock = '```js\nconst a = 1;\n```';
+r = feed(codeBlock.split(''));
+check('non-tool fenced block is given back as text', r.calls.length === 0 && r.text === codeBlock, r.text);
+check('...before the stream ends', r.flushedEarly > 0, r.flushedEarly);
+
+const truncated = '{"name": "read_file", "arg';
+r = feed([...truncated]);
+check('unterminated call never becomes text-mangling', r.calls.length === 0 && r.text === truncated, r.text);
+
+r = feed(['你好，', '我是鲁班。'], { toolNames: new Set() });
+check('splitter works without tools', r.calls.length === 0 && r.text === '你好，我是鲁班。', r);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
