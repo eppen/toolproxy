@@ -1,0 +1,5 @@
+node_modules/
+proxy.log
+proxy.out
+*.log
+.DS_Store

@@ -1,0 +1,17 @@
+{
+  "name": "toolproxy",
+  "version": "0.1.0",
+  "description": "Thin OpenAI-compatible proxy that teaches Ollama models to emit real tool_calls",
+  "type": "module",
+  "main": "proxy.mjs",
+  "bin": { "toolproxy": "./proxy.mjs" },
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node proxy.mjs",
+    "test": "node test.mjs",
+    "bench": "node bench.mjs 3",
+    "e2e": "node e2e.mjs"
+  },
+  "keywords": ["ollama", "openai", "proxy", "tool-calling", "llm"],
+  "license": "MIT"
+}
